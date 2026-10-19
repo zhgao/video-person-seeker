@@ -10,16 +10,28 @@ v1（保持不变）：扫描单个录好的监控视频，用 YOLO 检测"人"�
 v2（新增）：自然语言查询 + 多文件批量 + 弯腰（摘菜）启发式检测。
     python detect_people.py 视频文件夹 --query "这两天谁在摘菜"
 
+v2.1：本地网页版（见 web_app.py）：python web_app.py
+
+v2.2（新增）：两遍扫描（默认开启：粗扫定候选 → 精扫确认）+
+    多进程并行（--jobs N，默认 min(4, CPU核心数)）。
+    python detect_people.py 视频文件夹 --query "这两天谁在摘菜" --jobs 2
+    python detect_people.py 监控录像.mp4 --no-twopass   # 回退单遍检测
+
 依赖: pip install -r requirements.txt
 """
 import argparse
+import contextlib
+import io
 import json
 import math
+import multiprocessing as mp
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
+from concurrent.futures import ProcessPoolExecutor
 from datetime import date, datetime
 
 import cv2
@@ -64,9 +76,13 @@ def run_v1(args):
     os.makedirs(out_dir, exist_ok=True)
 
     # 延迟导入：--help 等不需要模型
-    from ultralytics import YOLO
-    print("正在加载 YOLO 模型（首次运行会自动下载 yolov8n.pt，约 6MB）…")
-    model = YOLO("yolov8n.pt")  # nano 版，最快
+    model = None
+    if args.jobs <= 1:
+        from ultralytics import YOLO
+        print("正在加载 YOLO 模型（首次运行会自动下载 yolov8n.pt，约 6MB）…")
+        model = YOLO("yolov8n.pt")  # nano 版，最快
+    else:
+        print("并行模式：各 worker 进程将独立加载模型（首次稍慢）…")
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -75,38 +91,29 @@ def run_v1(args):
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration = total_frames / fps if total_frames > 0 else 0
-    step = max(1, int(round(args.every * fps)))
+    cap.release()
 
     print(f"视频：{os.path.basename(video_path)}  "
           f"时长 {fmt_time(duration)}  帧率 {fps:.1f}")
     print(f"每 {args.every} 秒抽一帧检测（置信度阈值 {args.conf}）…")
+    if not args.no_twopass:
+        print(f"两遍扫描：粗扫每 {args.coarse_every} 秒定候选，"
+              f"精扫每 {args.every} 秒；并行 {args.jobs} 进程")
+    elif args.jobs > 1:
+        print(f"单遍扫描，并行 {args.jobs} 进程")
 
-    hits = []          # 检测到人的时间点（秒）
-    boxes_at = {}      # 时间点 -> 检测框（用于缩略图）
-    idx = 0
-    checked = 0
-    while True:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ok, frame = cap.read()
-        if not ok:
-            break
-        t = idx / fps
-        results = model.predict(frame, verbose=False, conf=args.conf)
-        people = [b for b in results[0].boxes
-                  if int(b.cls[0]) == 0]  # class 0 = person
-        if people:
-            hits.append(t)
-            boxes_at[t] = [(int(b.xyxy[0][0]), int(b.xyxy[0][1]),
-                            int(b.xyxy[0][2]), int(b.xyxy[0][3]))
-                           for b in people]
-        checked += 1
-        if total_frames:
-            pct = min(100.0, idx / total_frames * 100)
-            print(f"\r  进度 {pct:5.1f}%  已检测 {checked} 帧，发现 {len(hits)} 个有人时刻",
-                  end="", flush=True)
-        idx += step
+    def _v1prog(pct, extra=""):
+        # 保持原来的单行进度输出格式
+        print(f"\r  进度 {pct:5.1f}%{extra}", end="", flush=True)
+
+    # 统一扫描入口（默认两遍扫描 + 多进程；--no-twopass/--jobs=1 可回退）
+    hits_raw, _ = scan_video(
+        video_path, every=args.every, conf=args.conf, mode="person",
+        gap=args.gap, jobs=args.jobs, twopass=not args.no_twopass,
+        coarse_every=args.coarse_every, det_model=model, progress_cb=_v1prog)
     print()
-    cap.release()
+    hits = [t for _, t, _, _ in hits_raw]                # 检测到人的时间点（秒）
+    boxes_at = {t: boxes for _, t, boxes, _ in hits_raw}  # 时间点 -> 检测框
 
     # 合并连续时刻为片段：间隔 <= gap 则合并
     segments = []
@@ -330,13 +337,211 @@ def list_video_files(dir_path):
     return files
 
 
-# ---------------------------------------------------------------- v2：扫描
-def scan_video_v2(video_path, every, conf, mode, bend_angle, bend_secs, gap,
-                  det_model=None, pose_model=None):
-    """v2 扫描单个视频。
+# ------------------------------------------------- v2.2：两遍扫描 + 多进程
+def _detect_person_boxes(det_model, frame, conf):
+    """单帧人物检测，返回所有人物框 [(x1,y1,x2,y2)]（可能为空）。"""
+    results = det_model.predict(frame, verbose=False, conf=conf)
+    return [tuple(map(int, b.xyxy[0].tolist()))
+            for b in results[0].boxes if int(b.cls[0]) == 0]  # class 0 = person
 
-    mode='person'：人物检测；mode='bend'：人物+弯腰启发式（需 pose_model）。
-    返回 segments 列表，每项 {"start","end","thumb_t","box","angle"}。
+
+def _detect_one(cap, fps, fidx, mode, conf, bend_angle, det_model, pose_model):
+    """检测单帧。返回 (fidx, t, boxes, angle)，无命中返回 None。
+
+    boxes: 该帧所有人物框；bend 模式下只记录弯腰者的框、angle 为前倾角；
+    person 模式下 angle 为 None。
+    """
+    cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+    ok, frame = cap.read()
+    if not ok:
+        return None
+    t = fidx / fps
+    if mode == "bend" and pose_model is not None:
+        for box, angle, bending in analyze_frame_bend(
+                pose_model, frame, conf, bend_angle):
+            if bending:
+                return (fidx, t, [box], angle)  # 一帧只记一次（与原逻辑一致）
+        return None
+    boxes = _detect_person_boxes(det_model, frame, conf)
+    return (fidx, t, boxes, None) if boxes else None
+
+
+def _expand_candidates(segs, margin_sec, lo_sec, hi_sec):
+    """候选区间两端各外扩 margin_sec 秒，钳制到 [lo_sec, hi_sec]，合并重叠。
+
+    纯函数，方便单测。segs: [[s,e],...]（秒）；返回 [[ns,ne],...]。
+    """
+    expanded = []
+    for s, e in segs:
+        ns, ne = max(s - margin_sec, lo_sec), min(e + margin_sec, hi_sec)
+        if ns > ne:
+            continue
+        if expanded and ns <= expanded[-1][1] + 1e-6:
+            expanded[-1][1] = max(expanded[-1][1], ne)
+        else:
+            expanded.append([ns, ne])
+    return expanded
+
+
+def _coarse_intervals(cap, fps, f0, f1, coarse_every, conf, gap, det_model,
+                      on_progress=None):
+    """粗扫：只做人物检测（bend 模式也不跑 pose，省时间），返回候选区间。
+
+    on_progress(pct): 本阶段 0~100。候选为空时直接返回 []（整段可跳过精扫）。
+    """
+    step = max(1, int(round(coarse_every * fps)))
+    n = (f1 - f0 + step - 1) // step
+    hits, done, last = [], 0, 0.0
+    for fidx in range(f0, f1, step):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if _detect_person_boxes(det_model, frame, conf):
+            hits.append(fidx / fps)
+        done += 1
+        pct = 100.0 * done / max(n, 1)
+        if on_progress and pct - last >= 5:
+            on_progress(pct)
+            last = pct
+    # 按 gap 合并，再两端外扩 margin
+    segs = []
+    for t in hits:
+        if segs and t - segs[-1][1] <= gap + 1e-6:
+            segs[-1][1] = t
+        else:
+            segs.append([t, t])
+    if on_progress:
+        on_progress(100.0)
+    return _expand_candidates(segs, coarse_every, f0 / fps, f1 / fps)
+
+
+def _scan_range(p, on_progress=None):
+    """扫描帧区间 [p['f0'], p['f1'])，返回 hits [(fidx, t, boxes, angle)]。
+
+    p: dict，含 video_path/fps/every/conf/mode/bend_angle/bend_secs/gap/
+       twopass/coarse_every/det_model/pose_model。
+    det_model/pose_model 为 None 时自行加载（多进程 worker 场景）。
+    on_progress(pct, extra): pct 0~100；两遍模式下粗扫占 0~50、精扫占 50~100。
+    """
+    from ultralytics import YOLO  # 延迟导入：子进程里也需要
+    video_path, fps = p["video_path"], p["fps"]
+    f0, f1 = p["f0"], p["f1"]
+    every, conf, mode = p["every"], p["conf"], p["mode"]
+    det_model = p.get("det_model") or YOLO("yolov8n.pt")
+    pose_model = p.get("pose_model")
+    if mode == "bend" and pose_model is None:
+        pose_model = load_pose_model()
+        if pose_model is None:
+            raise RuntimeError("姿态模型 yolov8n-pose.pt 加载失败，无法做弯腰检测")
+
+    def _cb(pct, extra=""):
+        if on_progress:
+            on_progress(pct, extra)
+
+    step = max(1, int(round(every * fps)))
+    cap = cv2.VideoCapture(video_path)
+    hits = []
+    try:
+        if p["twopass"]:
+            intervals = _coarse_intervals(
+                cap, fps, f0, f1, p["coarse_every"], conf, p["gap"], det_model,
+                lambda pct: _cb(pct / 2, "（粗扫）"))
+            if not intervals:
+                _cb(100.0, "（粗扫无候选）")
+                return []
+            ranges = []
+            for s, e in intervals:
+                a = max(f0, int(s * fps))
+                b = min(f1, int(math.ceil(e * fps)))
+                if b > a:
+                    ranges.append((a, b))
+            fine_total = sum((b - a + step - 1) // step for a, b in ranges)
+            fine_done, last = 0, 50.0
+            for a, b in ranges:
+                for fidx in range(a, b, step):
+                    h = _detect_one(cap, fps, fidx, mode, conf,
+                                    p["bend_angle"], det_model, pose_model)
+                    if h:
+                        hits.append(h)
+                    fine_done += 1
+                    pct = 50.0 + 50.0 * fine_done / max(fine_total, 1)
+                    if pct - last >= 2:
+                        _cb(pct, "（精扫）")
+                        last = pct
+            _cb(100.0, "")
+        else:
+            n = (f1 - f0 + step - 1) // step
+            done, last = 0, 0.0
+            for fidx in range(f0, f1, step):
+                h = _detect_one(cap, fps, fidx, mode, conf,
+                                p["bend_angle"], det_model, pose_model)
+                if h:
+                    hits.append(h)
+                done += 1
+                pct = 100.0 * done / max(n, 1)
+                if pct - last >= 2:
+                    _cb(pct, f"  已检测 {done} 帧，发现 {len(hits)} 个有人时刻")
+                    last = pct
+            _cb(100.0, f"  已检测 {done} 帧，发现 {len(hits)} 个有人时刻")
+    finally:
+        cap.release()
+    return hits
+
+
+def _mp_worker(payload):
+    """子进程入口（spawn 上下文）：独立加载模型，扫描扩展区间，
+    只返回 assigned 区间 [a0, a1) 内的命中。
+
+    为什么用 overlap 而不只靠 --gap 缝合边界：
+    人物模式下 gap 缝合确实够用（边界两侧命中点间隔 ≤ every < gap）。
+    但弯腰模式要求"连续 bend_secs 秒"——一个横跨切分边界的弯腰动作会被
+    切成两段，每段都不足 bend_secs 而在两边被同时漏掉。
+    overlap（≥ max(bend_secs, gap, coarse_every) + every）让每个 worker
+    在扩展区内看到完整动作；扩展区只用于"看全"，上报时按 assigned 区间
+    过滤（同一帧只属于一个 worker），主进程再按时间排序统一合并，
+    因此边界不断裂、不漏报、不重复。
+
+    进度上报：payload['prog'] 是一个 Manager().dict() 代理（spawn 下
+    普通 mp.Queue 不能作为参数传递，只能用 Manager 代理），worker 直接
+    写 prog[wid]，主进程轮询汇总。
+    """
+    wid = payload.get("wid", 0)
+
+    def _prog(pct, extra=""):
+        try:
+            payload["prog"][wid] = round(pct, 1)
+        except Exception:
+            pass  # 进度上报失败不影响检测本身
+
+    try:
+        import torch
+        torch.set_num_threads(2)  # 避免 N 进程 × torch 默认线程数 oversubscription
+    except Exception as e:  # noqa: BLE001
+        return {"hits": [], "error": f"worker{wid} torch 初始化失败：{e}"}
+    try:
+        # worker 的 print 会污染主进程的进度行，统一抑制；异常走 error 返回
+        with contextlib.redirect_stdout(io.StringIO()):
+            hits = _scan_range(payload, _prog)
+    except Exception as e:  # noqa: BLE001 —— 必须显式上报，绝不静默丢数据
+        import traceback
+        return {"hits": [], "error": f"worker{wid} 扫描异常：{e}\n{traceback.format_exc()}"}
+    a0, a1 = payload["a0"], payload["a1"]
+    hits = [h for h in hits if a0 <= h[0] < a1]
+    return {"hits": hits, "error": None}
+
+
+def scan_video(video_path, *, every=1.0, conf=0.5, mode="person",
+               bend_angle=35.0, bend_secs=3.0, gap=3.0,
+               jobs=1, twopass=True, coarse_every=4.0,
+               det_model=None, pose_model=None, progress_cb=None):
+    """统一扫描入口：返回 (hits, duration)。
+
+    hits: [(fidx, t, boxes, angle)]，按 t 排序、按 fidx 去重；
+    boxes 为该时刻所有人物框，angle 仅弯腰模式有值。
+    jobs>1 时按时间切 N 段多进程并行（spawn），各 worker 独立跑两遍扫描
+    （扩展 overlap 保证边界不断裂），主进程汇总进度、统一合并命中。
+    progress_cb(pct, extra)：进度回调，CLI 保持原来的单行输出格式。
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -345,34 +550,92 @@ def scan_video_v2(video_path, every, conf, mode, bend_angle, bend_secs, gap,
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration = total_frames / fps if total_frames > 0 else 0
-    step = max(1, int(round(every * fps)))
-
-    hits = []  # (t, box, angle)
-    idx = 0
-    while True:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ok, frame = cap.read()
-        if not ok:
-            break
-        t = idx / fps
-        if mode == "bend" and pose_model is not None:
-            for box, angle, bending in analyze_frame_bend(
-                    pose_model, frame, conf, bend_angle):
-                if bending:
-                    hits.append((t, box, angle))
-                    break  # 一帧只记一次
-        else:
-            results = det_model.predict(frame, verbose=False, conf=conf)
-            people = [b for b in results[0].boxes if int(b.cls[0]) == 0]
-            if people:
-                # 取最大的人物框（离镜头最近，最可能看清"谁"）
-                b = max(people, key=lambda x: float(
-                    (x.xyxy[0][2] - x.xyxy[0][0]) *
-                    (x.xyxy[0][3] - x.xyxy[0][1])))
-                box = tuple(map(int, b.xyxy[0].tolist()))
-                hits.append((t, box, None))
-        idx += step
     cap.release()
+    if total_frames <= 0:
+        return [], duration
+
+    base = dict(video_path=os.path.abspath(video_path), fps=fps,
+                total_frames=total_frames, every=every, conf=conf, mode=mode,
+                bend_angle=bend_angle, bend_secs=bend_secs, gap=gap,
+                twopass=twopass, coarse_every=coarse_every)
+
+    def _cb(pct, extra=""):
+        if progress_cb:
+            progress_cb(pct, extra)
+
+    if jobs <= 1:
+        # 单进程：直接跑，可复用主进程已加载的模型，避免重复加载
+        hits = _scan_range(dict(base, f0=0, f1=total_frames,
+                                det_model=det_model, pose_model=pose_model),
+                           _cb)
+        return sorted(hits, key=lambda h: h[0]), duration
+
+    # ---- 多进程并行（spawn，跨平台一致；Windows 本来就只有 spawn） ----
+    # 注意：spawn 下普通 mp.Queue 不能作为任务参数传递（只能继承），
+    # 因此进度用 Manager().dict() 代理共享。
+    mgr = mp.Manager()
+    prog = mgr.dict({i: 0.0 for i in range(jobs)})
+    bounds = [total_frames * i // jobs for i in range(jobs + 1)]
+    ov_sec = max(bend_secs, gap, coarse_every if twopass else 0.0) + every
+    ov = int(math.ceil(ov_sec * fps))
+
+    with ProcessPoolExecutor(max_workers=jobs,
+                             mp_context=mp.get_context("spawn")) as ex:
+        fut_of = {}
+        for i in range(jobs):
+            a0, a1 = bounds[i], bounds[i + 1]
+            payload = dict(base, wid=i, f0=max(0, a0 - ov),
+                           f1=min(total_frames, a1 + ov),
+                           a0=a0, a1=a1, prog=prog,
+                           det_model=None, pose_model=None)  # worker 内独立加载
+            fut_of[ex.submit(_mp_worker, payload)] = i
+        while True:
+            remaining = [f for f in fut_of if not f.done()]
+            if not remaining:
+                break
+            _cb(sum(prog.get(i, 0.0) for i in range(jobs)) / jobs,
+                f"（并行 {jobs} 进程）")
+            time.sleep(0.5)
+        _cb(100.0, f"（并行 {jobs} 进程）")
+        # 收结果：worker 报错必须显式处理，绝不静默丢数据
+        all_hits = []
+        for fut, wid in fut_of.items():
+            r = fut.result()  # worker 内未捕获的异常会在这里重新抛出
+            if r.get("error"):
+                print(f"错误：{r['error']}")
+                print("多进程扫描失败，已终止（未生成任何结果，数据未丢）。")
+                sys.exit(1)
+            all_hits.extend(r["hits"])
+    mgr.shutdown()
+    seen, uniq = set(), []
+    for h in sorted(all_hits, key=lambda h: h[0]):
+        if h[0] not in seen:
+            seen.add(h[0])
+            uniq.append(h)
+    return uniq, duration
+
+
+# ---------------------------------------------------------------- v2：扫描
+def scan_video_v2(video_path, every, conf, mode, bend_angle, bend_secs, gap,
+                  det_model=None, pose_model=None, jobs=1, twopass=True,
+                  coarse_every=4.0, progress_cb=None):
+    """v2 扫描单个视频（统一走 scan_video：两遍扫描 + 多进程）。
+
+    mode='person'：人物检测；mode='bend'：人物+弯腰启发式（需 pose_model）。
+    返回 segments 列表，每项 {"start","end","thumb_t","box","angle"}。
+    """
+    hits_raw, duration = scan_video(
+        video_path, every=every, conf=conf, mode=mode,
+        bend_angle=bend_angle, bend_secs=bend_secs, gap=gap,
+        jobs=jobs, twopass=twopass, coarse_every=coarse_every,
+        det_model=det_model, pose_model=pose_model, progress_cb=progress_cb)
+    if duration == 0:
+        return [], 0
+    # 取最大的人物框（离镜头最近，最可能看清"谁"）——与原逻辑一致
+    hits = []  # (t, box, angle)
+    for _, t, boxes, angle in hits_raw:
+        box = max(boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
+        hits.append((t, box, angle))
 
     # 合并为片段
     segments = []
@@ -562,13 +825,28 @@ def run_v2(args, is_dir):
     os.makedirs(out_dir, exist_ok=True)
 
     # ---- 加载模型 ----
-    print("正在加载 YOLO 模型（首次运行会自动下载 yolov8n.pt，约 6MB）…")
-    det_model = YOLO("yolov8n.pt")
-    pose_model = None
-    if mode == "bend":
-        pose_model = load_pose_model()
-        if pose_model is None:
-            mode = "person"  # 优雅降级
+    det_model = pose_model = None
+    if args.jobs <= 1:
+        print("正在加载 YOLO 模型（首次运行会自动下载 yolov8n.pt，约 6MB）…")
+        det_model = YOLO("yolov8n.pt")
+        if mode == "bend":
+            pose_model = load_pose_model()
+            if pose_model is None:
+                mode = "person"  # 优雅降级
+    elif mode == "bend":
+        # 并行模式各 worker 独立加载模型；先探针确认 pose 可用，保持降级语义
+        if load_pose_model() is None:
+            mode = "person"
+        # 注：探针加载的模型会被释放，worker 内会重新加载（见 _mp_worker）
+    if not args.no_twopass:
+        print(f"两遍扫描：粗扫每 {args.coarse_every} 秒定候选，"
+              f"精扫每 {args.every} 秒；并行 {args.jobs} 进程")
+    elif args.jobs > 1:
+        print(f"单遍扫描，并行 {args.jobs} 进程")
+
+    def _v2prog(pct, extra=""):
+        # 单行进度输出（与 v1 同格式），\r 覆盖刷新
+        print(f"\r  进度 {pct:5.1f}%{extra}", end="", flush=True)
 
     # ---- 逐文件扫描 ----
     groups = []  # 按日期分组
@@ -577,7 +855,10 @@ def run_v2(args, is_dir):
         print(f"\n扫描：{os.path.basename(vf)}（{fdate}）…")
         segments, duration = scan_video_v2(
             vf, args.every, args.conf, mode,
-            args.bend_angle, args.bend_secs, args.gap, det_model, pose_model)
+            args.bend_angle, args.bend_secs, args.gap, det_model, pose_model,
+            jobs=args.jobs, twopass=not args.no_twopass,
+            coarse_every=args.coarse_every, progress_cb=_v2prog)
+        print()  # 结束进度行
         print(f"  → {len(segments)} 个片段")
         if not segments:
             continue
@@ -671,7 +952,21 @@ def main():
                     help="弯腰判定：持续秒数阈值（默认 3.0）")
     ap.add_argument("--no-extract", action="store_true",
                     help="关闭 --query 默认的片段提取合并")
+    # ---- v2.2 新增：两遍扫描 + 多进程 ----
+    ap.add_argument("--jobs", type=int, default=None,
+                    help="并行进程数（默认 min(4, CPU核心数)；设为 1 用单进程）")
+    ap.add_argument("--no-twopass", action="store_true",
+                    help="关闭两遍扫描，回退单遍全片检测（更慢，但不漏任何短于粗扫间隔的闪现）")
+    ap.add_argument("--coarse-every", type=float, default=None,
+                    help="粗扫抽帧间隔秒（默认 max(2.0, every*4)；调小减少漏检、调大更快）")
     args = ap.parse_args()
+
+    if args.jobs is None:
+        args.jobs = max(1, min(4, os.cpu_count() or 1))
+    if args.jobs < 1:
+        args.jobs = 1
+    if args.coarse_every is None:
+        args.coarse_every = max(2.0, args.every * 4)
 
     target = os.path.abspath(args.video)
     is_dir = args.dir or os.path.isdir(target)
